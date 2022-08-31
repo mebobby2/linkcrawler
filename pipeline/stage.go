@@ -4,6 +4,8 @@ import (
 	"context"
 	"sync"
 
+	"github.com/blevesearch/bleve/analysis/token/stop"
+	"golang.org/x/text/cases"
 	"golang.org/x/xerrors"
 )
 
@@ -83,4 +85,61 @@ func (p *fixedWorkerPool) Run(ctx context.Context, params StageParams) {
 	}
 
 	wg.Wait()
+}
+
+type dynamicWorkerPool struct {
+	proc      Processor
+	tokenPool chan struct{}
+}
+
+func DynamicWorkerPool(proc Processor, maxWorkers int) StageRunner {
+	if maxWorkers <= 0 {
+		panic("DynamicWorkerPool: maxWorkers must be > 0")
+	}
+	tokenPool := make(chan struct{}, maxWorkers)
+	for i := 0; i < maxWorkers; i++ {
+		tokenPool <- struct{}{}
+	}
+	return &dynamicWorkerPool(proc: proc, tokenPool: tokenPool)
+}
+
+func (p *dynamicWorkerPool) Run(ctx context.Context, params StageParams) {
+stop:
+		for {
+			select {
+			case <- ctx.Done():
+				break stop // Asked to cleanly shut down
+			case payloadIn, ok := <-params.Input():
+				if !ok { break stop }
+
+				var token struct{}
+				select {
+					case token = <-p.tokenPool;
+					case <-ctx.Done():
+						break stop
+				}
+
+				go func(payloadIn Payload, token struct{}) {
+					defer func() { p.tokenPool <- token }()
+					payloadOut, err := p.proc.Process(ctx, payloadIn)
+					if err != nil {
+						wrappedErr := xerrors.Errorf("pipeline stage %d: %w", params.StateIndex(), err)
+						maybeEmitError(wrappedErr, params.Error())
+						return
+					}
+					if payloadOut == nil {
+						payloadIn.MarkAsProcessed()
+						return
+					}
+					select {
+					case params.Output() <- payloadOut:
+					case <- ctx.Done():
+					}
+				}(payloadIn, token)
+			}
+		}
+
+		for i := 0; i < cap(p.tokenPool); i++ { // wait for all workers to exit
+			<-p.tokenPool
+		}
 }
